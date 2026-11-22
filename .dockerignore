@@ -22,3 +22,4 @@
 !deployment/self-host/
 !deployment/self-host/Dockerfile
 !deployment/self-host/healthcheck.mjs
+!deployment/self-host/docker-proxy.mjs
