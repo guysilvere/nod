@@ -1,0 +1,195 @@
+name: nod-prod
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: deployment/self-host/Dockerfile
+    image: nod-server:${NOD_IMAGE_TAG:-local}
+    restart: unless-stopped
+    init: true
+    expose:
+      - '4310'
+    environment:
+      NODE_ENV: production
+      NOD_ENVIRONMENT: production
+      NOD_HOST: 0.0.0.0
+      PORT: ${PORT:-4310}
+      NOD_DATA_ROOT: /var/lib/nod
+      NOD_PUBLIC_URL: ${NOD_PUBLIC_URL:?NOD_PUBLIC_URL is required}
+      NOD_AUTH_TOKEN: ${NOD_AUTH_TOKEN:?NOD_AUTH_TOKEN is required}
+      NOD_VAULT_KEY: ${NOD_VAULT_KEY:?NOD_VAULT_KEY is required}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://nod:${NOD_POSTGRES_PASSWORD:?NOD_POSTGRES_PASSWORD is required}@postgres:5432/nod}
+      DOCKER_HOST: tcp://runtime:2375
+      WORKSPACE_CONTAINER: nod-workspace-${COMPOSE_PROJECT_NAME:-nod-prod}
+      BROWSER_CONTAINER: nod-browser-${COMPOSE_PROJECT_NAME:-nod-prod}
+      NOD_ANALYTICS_ENABLED: ${NOD_ANALYTICS_ENABLED:-false}
+    volumes:
+      - server-data:/var/lib/nod
+      - workspace-data:/var/lib/nod/workspaces
+    tmpfs:
+      - /tmp:uid=1000,gid=1000,mode=1777,size=256m
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 512
+    mem_limit: ${NOD_SERVER_MEMORY:-2g}
+    networks: [backend, control, outbound, coolify]
+    labels:
+      - 'traefik.enable=true'
+      - 'traefik.docker.network=coolify'
+      - 'traefik.http.routers.nod-http.rule=Host(`${NOD_DOMAIN}`)'
+      - 'traefik.http.routers.nod-http.entryPoints=http'
+      - 'traefik.http.routers.nod-http.middlewares=nod-redirect-to-https'
+      - 'traefik.http.routers.nod-https.rule=Host(`${NOD_DOMAIN}`)'
+      - 'traefik.http.routers.nod-https.entryPoints=https'
+      - 'traefik.http.routers.nod-https.tls=true'
+      - 'traefik.http.routers.nod-https.tls.certresolver=letsencrypt'
+      - 'traefik.http.services.nod.loadbalancer.server.port=4310'
+      - 'traefik.http.middlewares.nod-redirect-to-https.redirectscheme.scheme=https'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      runtime:
+        condition: service_started
+      browser:
+        condition: service_healthy
+      workspace:
+        condition: service_started
+    healthcheck:
+      test: ['CMD', 'node', '/app/healthcheck.mjs']
+      interval: 15s
+      timeout: 6s
+      retries: 10
+      start_period: 60s
+
+  postgres:
+    image: postgres:17-alpine@sha256:eee6c6e1b0894fa4fe0075eb054af9fd1cf39a35321c2d4110626cfe506411fb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nod
+      POSTGRES_PASSWORD: ${NOD_POSTGRES_PASSWORD:?NOD_POSTGRES_PASSWORD is required}
+      POSTGRES_DB: nod
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U nod -d nod']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+    image: nod-runtime:${NOD_IMAGE_TAG:-local}
+    restart: unless-stopped
+    init: true
+    environment:
+      WORKSPACE_CONTAINER: nod-workspace-${COMPOSE_PROJECT_NAME:-nod-prod}
+      BROWSER_CONTAINER: nod-browser-${COMPOSE_PROJECT_NAME:-nod-prod}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [control]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+
+  browser:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    image: nod-browser:${NOD_IMAGE_TAG:-local}
+    container_name: nod-browser-${COMPOSE_PROJECT_NAME:-nod-prod}
+    hostname: nod-browser
+    restart: unless-stopped
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    pids_limit: 1024
+    mem_limit: ${NOD_BROWSER_MEMORY:-3g}
+    shm_size: 512m
+    volumes:
+      - browser-data:/data
+    tmpfs:
+      - /tmp:size=512m
+      - /home/node:uid=1000,gid=1000,mode=700,size=256m
+    networks: [browser]
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          'const s=require("node:net").connect("/data/control.sock");s.on("connect",()=>{s.end();process.exit(0)});s.on("error",()=>process.exit(1))',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  workspace:
+    build:
+      context: .
+      dockerfile: Dockerfile.workspace
+    image: nod-workspace:${NOD_IMAGE_TAG:-local}
+    container_name: nod-workspace-${COMPOSE_PROJECT_NAME:-nod-prod}
+    restart: unless-stopped
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 512
+    mem_limit: ${NOD_WORKSPACE_MEMORY:-2g}
+    volumes:
+      - workspace-data:/workspace
+      - workspace-tools:/home/node
+    network_mode: service:workspace-network
+    depends_on:
+      workspace-network:
+        condition: service_healthy
+        restart: true
+    command: ['sleep', 'infinity']
+
+  workspace-network:
+    image: nod-workspace:${NOD_IMAGE_TAG:-local}
+    pull_policy: never
+    dns: [1.1.1.1, 8.8.8.8]
+    user: root
+    restart: unless-stopped
+    init: true
+    entrypoint: /usr/local/bin/nod-workspace-network
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m
+    pids_limit: 32
+    mem_limit: 64m
+    networks: [workspace]
+    healthcheck:
+      test: ['CMD', 'test', '-f', '/tmp/network-ready']
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+networks:
+  backend:
+    internal: true
+  control:
+    internal: true
+  outbound:
+  browser:
+  workspace:
+  coolify:
+    external: true
+
+volumes:
+  server-data:
+  postgres-data:
+  workspace-data:
+  workspace-tools:
+  browser-data:
